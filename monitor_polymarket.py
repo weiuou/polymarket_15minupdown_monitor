@@ -13,12 +13,12 @@ import bisect
 # Configuration
 SLUG = "btc-updown-15m-1767920400"
 POLL_INTERVAL = 1  # seconds
-CSV_FILE = "polymarket_btc_15m.csv"
+CSV_FILE = "polymarket_15m.csv"
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description='Monitor Polymarket BTC 15m Event')
+    parser = argparse.ArgumentParser(description='Monitor Polymarket 15m Up/Down Events')
     parser.add_argument('--strike', type=float, help='Manually set the Strike Price (Price to Beat) from the website to calibrate Chainlink offset.')
-    parser.add_argument('--slug', type=str, default=SLUG, help='Event slug to monitor.')
+    parser.add_argument('--slug', type=str, default="btc", help='Asset (btc/eth/sol/xrp) or full event slug/URL.')
     return parser.parse_args()
 
 def get_polymarket_data(slug):
@@ -62,13 +62,55 @@ def get_best_prices_from_clob_book(clob_data):
     return best_bid, best_ask
 
 # Chainlink Data Streams Config
-CL_STREAM_FEED_ID = "0x00039d9e45394f473ab1f050a1b963e6b05351e52d71e507509ada0c95ed75b8"
 CL_STREAM_URL = "https://data.chain.link/api/query-timescale"
 CL_STREAM_QUERY = "LIVE_STREAM_REPORTS_QUERY"
 CL_STREAM_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Content-Type": "application/json"
 }
+
+ASSET_FEED_ID = {
+    "btc": "0x00039d9e45394f473ab1f050a1b963e6b05351e52d71e507509ada0c95ed75b8",
+    "eth": "0x000362205e10b3a147d02792eccee483dca6c7b44ecce7012cb8c6e0b68b3ae9",
+    "sol": "0x0003b778d3f6b2ac4991302b89cb313f99a42467d6c9c5f96f57c29c0d2bc24f",
+    "xrp": "0x0003c16c6aed42294f5cb4741f6e59ba2d728f0eae2eb9e6d3f555808c59fc45",
+}
+
+ACTIVE_ASSET = "btc"
+ACTIVE_FEED_ID = ASSET_FEED_ID["btc"]
+ACTIVE_FEED_LOCK = threading.Lock()
+
+def _parse_asset_from_slug(slug):
+    if not slug:
+        return None
+    s = slug.strip()
+    if s.startswith("http://") or s.startswith("https://"):
+        m_url = re.search(r"/event/([^/?#]+)", s)
+        if m_url:
+            s = m_url.group(1)
+
+    s_low = s.lower()
+    if s_low in ASSET_FEED_ID:
+        return s_low
+
+    m = re.match(r"^([a-z0-9]+)-updown-15m(?:-\d+)?$", s_low)
+    if not m:
+        return None
+    return m.group(1).lower()
+
+def _set_active_asset(asset):
+    global ACTIVE_ASSET, ACTIVE_FEED_ID
+    asset = (asset or "").lower()
+    if asset not in ASSET_FEED_ID:
+        asset = "btc"
+    with ACTIVE_FEED_LOCK:
+        if asset == ACTIVE_ASSET:
+            return
+        ACTIVE_ASSET = asset
+        ACTIVE_FEED_ID = ASSET_FEED_ID[asset]
+        with CHAINLINK_CACHE._lock:
+            CHAINLINK_CACHE._times.clear()
+            CHAINLINK_CACHE._prices.clear()
 
 def _chainlink_ts_to_epoch(ts_iso):
     if not ts_iso:
@@ -80,8 +122,8 @@ def _chainlink_ts_to_epoch(ts_iso):
         ts_dt = ts_dt.replace(tzinfo=timezone.utc)
     return ts_dt.timestamp()
 
-def fetch_chainlink_stream_points(variables):
-    params = {"query": CL_STREAM_QUERY, "variables": json.dumps(variables)}
+def fetch_chainlink_stream_points(feed_id):
+    params = {"query": CL_STREAM_QUERY, "variables": json.dumps({"feedId": feed_id})}
     response = requests.get(CL_STREAM_URL, params=params, headers=CL_STREAM_HEADERS, timeout=5)
     response.raise_for_status()
     data = response.json()
@@ -103,7 +145,9 @@ def fetch_chainlink_stream_points(variables):
     return points
 
 def fetch_chainlink_stream_latest():
-    points = fetch_chainlink_stream_points({"feedId": CL_STREAM_FEED_ID})
+    with ACTIVE_FEED_LOCK:
+        feed_id = ACTIVE_FEED_ID
+    points = fetch_chainlink_stream_points(feed_id)
     if not points:
         return None
     ts, price = points[-1]
@@ -170,7 +214,9 @@ def chainlink_price_collector(stop_event, poll_interval=1.0, csv_store=None, bac
     while not stop_event.is_set():
         added_any = False
         try:
-            points = fetch_chainlink_stream_points({"feedId": CL_STREAM_FEED_ID})
+            with ACTIVE_FEED_LOCK:
+                feed_id = ACTIVE_FEED_ID
+            points = fetch_chainlink_stream_points(feed_id)
             latest = CHAINLINK_CACHE.latest()
             last_ts = latest[0] if latest else None
             for ts, price in points:
@@ -199,7 +245,7 @@ def get_chainlink_price_at(target_ts):
 CSV_HEADER = [
     "Timestamp",
     "Time_Left_Sec",
-    "BTC_Price_Stream",
+    "Price_Stream",
     "Strike_Price",
     "Diff",
     "Up_Price",
@@ -329,6 +375,9 @@ class CsvStore:
 
             header = rows[0]
             data_rows = rows[1:]
+
+            if header == ["Timestamp", "Time_Left_Sec", "BTC_Price_Stream", "Strike_Price", "Diff", "Up_Price", "Best_Bid", "Best_Ask", "Extra", "Slug"]:
+                header = CSV_HEADER
 
             needs_rewrite = header != CSV_HEADER
             normalized = []
@@ -583,6 +632,8 @@ def parse_market_info(data):
             # Parse End Time
             end_dt_str = f"{year} {date_part} {end_time_part}"
             end_dt_et = datetime.strptime(end_dt_str, "%Y %B %d %I:%M%p")
+            if end_dt_et <= start_dt_et:
+                end_dt_et = end_dt_et + timedelta(days=1)
             end_dt_utc = (end_dt_et + timedelta(hours=5)).replace(tzinfo=timezone.utc)
             
             expiry_dt = end_dt_utc
@@ -614,7 +665,8 @@ def parse_market_info(data):
 
 
 def print_table_header():
-    header = f"{'Time':<10} | {'Left':<10} | {'BTC Price':<10} | {'Strike':<10} | {'Diff':<10} | {'Up Price':<10} | {'Ask':<6} | {'Bid':<6} | {'Status'}"
+    price_label = f"{ACTIVE_ASSET.upper()} Price"
+    header = f"{'Time':<10} | {'Left':<10} | {price_label:<10} | {'Strike':<10} | {'Diff':<10} | {'Up Price':<10} | {'Ask':<6} | {'Bid':<6} | {'Status'}"
     print("-" * len(header))
     print(header)
     print("-" * len(header))
@@ -627,17 +679,24 @@ def get_current_slug_ts():
     return base_ts
 
 def get_slug_from_ts(ts):
-    return f"btc-updown-15m-{ts}"
+    return f"{ACTIVE_ASSET}-updown-15m-{ts}"
+
+def get_slug_from_ts_for_asset(asset, ts):
+    asset = (asset or "btc").lower()
+    return f"{asset}-updown-15m-{ts}"
 
 def main():
     args = parse_arguments()
-    csv_store = CsvStore(CSV_FILE)
+    base_asset = _parse_asset_from_slug(args.slug) or "btc"
+    _set_active_asset(base_asset)
+    csv_path = f"polymarket_{base_asset}_15m.csv"
+    csv_store = CsvStore(csv_path)
     
     print_table_header()
     
     calibrated = False
     current_market_ts = 0
-    target_slug = args.slug
+    target_slug = get_slug_from_ts_for_asset(base_asset, get_current_slug_ts())
     last_strike_price = None
     stop_event = threading.Event()
     price_thread = threading.Thread(
@@ -658,14 +717,13 @@ def main():
     try:
         while True:
             # 1. Slug Rotation
-            if not args.slug or args.slug == SLUG:
-                ts = get_current_slug_ts()
-                if ts != current_market_ts:
-                    current_market_ts = ts
-                    target_slug = get_slug_from_ts(ts)
-                    print(f"\n[System] Switching to market: {target_slug}")
-                    calibrated = False # Recalibrate for new market
-                    last_strike_price = None
+            ts = get_current_slug_ts()
+            if ts != current_market_ts:
+                current_market_ts = ts
+                target_slug = get_slug_from_ts_for_asset(base_asset, ts)
+                print(f"\n[System] Switching to market: {target_slug}")
+                calibrated = False
+                last_strike_price = None
 
             # 2. Fetch Data
             poly_data = get_polymarket_data(target_slug)
