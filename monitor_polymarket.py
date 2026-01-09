@@ -279,6 +279,24 @@ def _try_parse_float(s):
     except Exception:
         return None
 
+def _asset_price_decimals(asset):
+    a = (asset or "").lower()
+    if a == "xrp":
+        return 4
+    return 2
+
+def _asset_from_csv_path(path):
+    base = os.path.basename(path or "").lower()
+    for a in ("btc", "eth", "sol", "xrp"):
+        if f"_{a}_" in base or base.startswith(f"polymarket_{a}_"):
+            return a
+    return None
+
+def _fmt_price(v, decimals):
+    if v is None:
+        return ""
+    return f"{float(v):.{int(decimals)}f}"
+
 def _chainlink_asof(times, prices, target_ts):
     if not times:
         return None
@@ -332,6 +350,8 @@ def get_strike_price_from_stream_for_slug(slug, chainlink_cache=None):
 class CsvStore:
     def __init__(self, path):
         self.path = path
+        self.asset = _asset_from_csv_path(path)
+        self.price_decimals = _asset_price_decimals(self.asset)
         self._lock = threading.RLock()
         self._ensure_normalized()
 
@@ -450,23 +470,25 @@ class CsvStore:
                 except Exception:
                     continue
 
-                btc_2 = None
+                decimals = int(self.price_decimals)
+                tol = max(0.5 * (10 ** (-decimals)), 1e-12)
+                stream_px = None
                 if has_cache:
                     btc_price = _chainlink_asof(times, prices, row_ts)
                     if btc_price is not None:
-                        btc_2 = round(btc_price, 2)
+                        stream_px = round(btc_price, decimals)
                         existing_btc = _try_parse_float(r[CSV_I_BTC])
-                        if existing_btc is None or abs(existing_btc - btc_2) > 0.005:
-                            r[CSV_I_BTC] = f"{btc_2:.2f}"
+                        if existing_btc is None or abs(existing_btc - stream_px) > tol:
+                            r[CSV_I_BTC] = f"{stream_px:.{decimals}f}"
                             updated += 1
                     else:
                         existing_btc = _try_parse_float(r[CSV_I_BTC])
                         if existing_btc is not None:
-                            btc_2 = round(existing_btc, 2)
+                            stream_px = round(existing_btc, decimals)
                 else:
                     existing_btc = _try_parse_float(r[CSV_I_BTC])
                     if existing_btc is not None:
-                        btc_2 = round(existing_btc, 2)
+                        stream_px = round(existing_btc, decimals)
 
                 strike = None
                 slug = r[CSV_I_SLUG]
@@ -499,22 +521,22 @@ class CsvStore:
 
                 strike_for_diff = None
                 if strike is not None:
-                    strike_2 = round(strike, 2)
+                    strike_2 = round(strike, decimals)
                     existing_strike = _try_parse_float(r[CSV_I_STRIKE])
-                    if existing_strike is None or abs(existing_strike - strike_2) > 0.005:
-                        r[CSV_I_STRIKE] = f"{strike_2:.2f}"
+                    if existing_strike is None or abs(existing_strike - strike_2) > tol:
+                        r[CSV_I_STRIKE] = f"{strike_2:.{decimals}f}"
                         updated += 1
                     strike_for_diff = strike_2
                 else:
                     existing_strike = _try_parse_float(r[CSV_I_STRIKE])
                     if existing_strike is not None:
-                        strike_for_diff = round(existing_strike, 2)
+                        strike_for_diff = round(existing_strike, decimals)
 
-                if btc_2 is not None and strike_for_diff is not None:
-                    diff_2 = round(btc_2 - strike_for_diff, 2)
+                if stream_px is not None and strike_for_diff is not None:
+                    diff_2 = round(stream_px - strike_for_diff, decimals)
                     existing_diff = _try_parse_float(r[CSV_I_DIFF])
-                    if existing_diff is None or abs(existing_diff - diff_2) > 0.005:
-                        r[CSV_I_DIFF] = f"{diff_2:.2f}"
+                    if existing_diff is None or abs(existing_diff - diff_2) > tol:
+                        r[CSV_I_DIFF] = f"{diff_2:.{decimals}f}"
                         updated += 1
 
                 data_rows[i] = r
@@ -812,6 +834,7 @@ def _monitor_target(asset, fixed_slug, args, stop_event, chainlink_cache, csv_st
                     start_ts = info['expiry_dt'] - timedelta(minutes=15)
                     actual_strike = info['strike_price']
                     calibrated = True
+                    decimals = _asset_price_decimals(asset)
 
                     _safe_print(f"\n[Calibration] Market: {target_slug}")
                     _safe_print(f"[Calibration] Title:      {info.get('title', 'N/A')}")
@@ -822,29 +845,30 @@ def _monitor_target(asset, fixed_slug, args, stop_event, chainlink_cache, csv_st
                         before = cl_data.get("before")
                         if before:
                             before_ts_dt = datetime.fromtimestamp(before["ts"], timezone.utc)
-                            _safe_print(f"[Calibration] Chainlink [Before]: {before['price']:.2f} @ {before_ts_dt.strftime('%H:%M:%S')} (Delta: {(before_ts_dt - start_ts).total_seconds():.0f}s)")
+                            _safe_print(f"[Calibration] Chainlink [Before]: {_fmt_price(before['price'], decimals)} @ {before_ts_dt.strftime('%H:%M:%S')} (Delta: {(before_ts_dt - start_ts).total_seconds():.0f}s)")
                         else:
                             _safe_print(f"[Calibration] Chainlink [Before]: N/A")
 
                         after = cl_data.get("after")
                         if after:
                             after_ts_dt = datetime.fromtimestamp(after["ts"], timezone.utc)
-                            _safe_print(f"[Calibration] Chainlink [After]:  {after['price']:.2f} @ {after_ts_dt.strftime('%H:%M:%S')} (Delta: {(after_ts_dt - start_ts).total_seconds():.0f}s)")
+                            _safe_print(f"[Calibration] Chainlink [After]:  {_fmt_price(after['price'], decimals)} @ {after_ts_dt.strftime('%H:%M:%S')} (Delta: {(after_ts_dt - start_ts).total_seconds():.0f}s)")
                         else:
                             _safe_print(f"[Calibration] Chainlink [After]:  N/A (No update yet)")
                     else:
                         _safe_print(f"[Calibration] Chainlink Data: N/A")
 
-                    _safe_print(f"[Calibration] Strike Price (Base): {actual_strike:.2f}")
+                    _safe_print(f"[Calibration] Strike Price (Base): {_fmt_price(actual_strike, decimals)}")
 
                 display_price = px_now
                 display_strike = info['strike_price']
+                decimals = _asset_price_decimals(asset)
 
-                if display_strike:
+                if display_strike is not None:
                     diff = display_price - display_strike
-                    diff_str = f"{diff:.2f}"
+                    diff_str = _fmt_price(diff, decimals)
                     status = "ITM" if diff > 0 else "OTM"
-                    strike_str = f"{display_strike:.2f}"
+                    strike_str = _fmt_price(display_strike, decimals)
                 else:
                     diff_str = "-"
                     status = "Wait"
@@ -866,7 +890,7 @@ def _monitor_target(asset, fixed_slug, args, stop_event, chainlink_cache, csv_st
                 csv_store.append_row([
                     now.isoformat(),
                     f"{time_left_sec:.0f}",
-                    f"{display_price:.2f}",
+                    _fmt_price(display_price, decimals),
                     strike_str,
                     diff_str,
                     f"{info['yes_price']:.2f}",
@@ -876,7 +900,7 @@ def _monitor_target(asset, fixed_slug, args, stop_event, chainlink_cache, csv_st
                     target_slug
                 ])
 
-                row = f"{now.strftime('%H:%M:%S'):<10} | {time_left_str:<10} | {display_price:<10.2f} | {strike_str:<10} | {diff_str:<10} | {info['yes_price']:<10.2f} | {info['best_ask']:<6.2f} | {info['best_bid']:<6.2f} | {status}"
+                row = f"{now.strftime('%H:%M:%S'):<10} | {time_left_str:<10} | {display_price:<10.{decimals}f} | {strike_str:<10} | {diff_str:<10} | {info['yes_price']:<10.2f} | {info['best_ask']:<6.2f} | {info['best_bid']:<6.2f} | {status}"
                 if show_prefix:
                     row = f"{asset.upper():<5} | {row}"
                 _safe_print(row)
