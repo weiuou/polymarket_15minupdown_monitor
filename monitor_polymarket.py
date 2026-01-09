@@ -19,6 +19,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='Monitor Polymarket 15m Up/Down Events')
     parser.add_argument('--strike', type=float, help='Manually set the Strike Price (Price to Beat) from the website to calibrate Chainlink offset.')
     parser.add_argument('--slug', type=str, default="btc", help='Asset (btc/eth/sol/xrp) or full event slug/URL.')
+    parser.add_argument('--slugs', nargs='+', default=None, help='Multiple assets/slugs. Supports space-separated and comma-separated values.')
     return parser.parse_args()
 
 def get_polymarket_data(slug):
@@ -286,7 +287,7 @@ def _chainlink_asof(times, prices, target_ts):
         return prices[i]
     return None
 
-STRIKE_MAX_DELTA_MIN = 1.0
+STRIKE_MAX_DELTA_SEC = 3.0
 
 def _chainlink_pick_strike_with_delta(times, prices, target_ts):
     if not times:
@@ -317,11 +318,12 @@ def _try_slug_ts(slug):
     except Exception:
         return None
 
-def get_strike_price_from_stream_for_slug(slug):
+def get_strike_price_from_stream_for_slug(slug, chainlink_cache=None):
     slug_ts = _try_slug_ts(slug)
     if slug_ts is None:
         return None
-    times, prices = CHAINLINK_CACHE.snapshot_series()
+    cache = chainlink_cache or CHAINLINK_CACHE
+    times, prices = cache.snapshot_series()
     strike, delta_sec = _chainlink_pick_strike_with_delta(times, prices, float(slug_ts))
     if strike is None:
         return None
@@ -410,8 +412,9 @@ class CsvStore:
                 writer = csv.writer(f)
                 writer.writerow(row)
 
-    def backfill_from_chainlink_cache(self, max_rows=3000):
-        times, prices = CHAINLINK_CACHE.snapshot_series()
+    def backfill_from_chainlink_cache(self, max_rows=3000, chainlink_cache=None):
+        cache = chainlink_cache or CHAINLINK_CACHE
+        times, prices = cache.snapshot_series()
         has_cache = bool(times)
 
         with self._lock:
@@ -474,7 +477,7 @@ class CsvStore:
                             strike, strike_invalid = strike_cache[slug_ts]
                         else:
                             strike, strike_delta_sec = _chainlink_pick_strike_with_delta(times, prices, float(slug_ts))
-                            strike_invalid = bool(strike_delta_sec is not None and (strike_delta_sec / 60.0) > STRIKE_MAX_DELTA_MIN)
+                            strike_invalid = bool(strike_delta_sec is not None and strike_delta_sec > STRIKE_MAX_DELTA_SEC)
                             strike_cache[slug_ts] = (strike, strike_invalid)
                             if strike_invalid:
                                 strike = None
@@ -527,7 +530,7 @@ class CsvStore:
             os.replace(tmp_path, self.path)
             return updated
 
-def parse_market_info(data):
+def parse_market_info(data, chainlink_cache=None):
     if not data:
         return None
         
@@ -643,7 +646,8 @@ def parse_market_info(data):
             if now_utc >= start_dt_utc:
                 # Fetch Chainlink Strike Price (Official Source)
                 ts_sec = int(start_dt_utc.timestamp())
-                chainlink_data = get_chainlink_price_at(ts_sec)
+                cache = chainlink_cache or CHAINLINK_CACHE
+                chainlink_data = cache.get_around(ts_sec)
         except ValueError as e:
             print(f"Date parsing error for Up/Down: {e}")
             return None
@@ -664,12 +668,22 @@ def parse_market_info(data):
 
 
 
-def print_table_header():
-    price_label = f"{ACTIVE_ASSET.upper()} Price"
-    header = f"{'Time':<10} | {'Left':<10} | {price_label:<10} | {'Strike':<10} | {'Diff':<10} | {'Up Price':<10} | {'Ask':<6} | {'Bid':<6} | {'Status'}"
-    print("-" * len(header))
-    print(header)
-    print("-" * len(header))
+PRINT_LOCK = threading.Lock()
+
+def _safe_print(*args, **kwargs):
+    with PRINT_LOCK:
+        print(*args, **kwargs)
+
+def print_table_header(asset=None, show_prefix=False):
+    asset = (asset or ACTIVE_ASSET or "btc").lower()
+    price_label = f"{asset.upper()} Price"
+    if show_prefix:
+        header = f"{'Asset':<5} | {'Time':<10} | {'Left':<10} | {price_label:<10} | {'Strike':<10} | {'Diff':<10} | {'Up Price':<10} | {'Ask':<6} | {'Bid':<6} | {'Status'}"
+    else:
+        header = f"{'Time':<10} | {'Left':<10} | {price_label:<10} | {'Strike':<10} | {'Diff':<10} | {'Up Price':<10} | {'Ask':<6} | {'Bid':<6} | {'Status'}"
+    _safe_print("-" * len(header))
+    _safe_print(header)
+    _safe_print("-" * len(header))
 
 def get_current_slug_ts():
     now = datetime.now(timezone.utc)
@@ -685,172 +699,251 @@ def get_slug_from_ts_for_asset(asset, ts):
     asset = (asset or "btc").lower()
     return f"{asset}-updown-15m-{ts}"
 
-def main():
-    args = parse_arguments()
-    base_asset = _parse_asset_from_slug(args.slug) or "btc"
-    _set_active_asset(base_asset)
-    csv_path = f"polymarket_{base_asset}_15m.csv"
-    csv_store = CsvStore(csv_path)
-    
-    print_table_header()
-    
+def _extract_event_slug_from_input(s):
+    if s is None:
+        return ""
+    s = str(s).strip()
+    if s.startswith("http://") or s.startswith("https://"):
+        m_url = re.search(r"/event/([^/?#]+)", s)
+        if m_url:
+            return m_url.group(1)
+    return s
+
+def _parse_slug_inputs(args):
+    raw = args.slugs if args.slugs else [args.slug]
+    out = []
+    for item in raw:
+        if item is None:
+            continue
+        for part in str(item).split(","):
+            v = part.strip()
+            if v:
+                out.append(v)
+    seen = set()
+    uniq = []
+    for v in out:
+        if v in seen:
+            continue
+        seen.add(v)
+        uniq.append(v)
+    return uniq
+
+def _is_fixed_event_slug(slug):
+    s = (slug or "").strip().lower()
+    return bool(re.match(r"^[a-z0-9]+-updown-15m-\d+$", s))
+
+def chainlink_price_collector_for_asset(asset, chainlink_cache, stop_event, poll_interval=1.0, csv_store=None, backfill_interval=2.0):
+    asset = (asset or "btc").lower()
+    feed_id = ASSET_FEED_ID.get(asset)
+    if not feed_id:
+        return
+    last_backfill_wall = 0.0
+    while not stop_event.is_set():
+        added_any = False
+        try:
+            points = fetch_chainlink_stream_points(feed_id)
+            latest = chainlink_cache.latest()
+            last_ts = latest[0] if latest else None
+            for ts, price in points:
+                if last_ts is None or ts > last_ts:
+                    chainlink_cache.add(ts, price)
+                    last_ts = ts
+                    added_any = True
+        except Exception as e:
+            _safe_print(f"Error fetching Chainlink Stream price ({asset}): {e}")
+
+        if csv_store and added_any:
+            now_wall = time.time()
+            if now_wall - last_backfill_wall >= backfill_interval:
+                try:
+                    csv_store.backfill_from_chainlink_cache(max_rows=5000, chainlink_cache=chainlink_cache)
+                except Exception as e:
+                    _safe_print(f"[Backfill:{asset}] Failed: {e}")
+                last_backfill_wall = now_wall
+
+        stop_event.wait(poll_interval)
+
+def _monitor_target(asset, fixed_slug, args, stop_event, chainlink_cache, csv_store, show_prefix=False):
+    asset = (asset or "btc").lower()
+    print_table_header(asset=asset, show_prefix=show_prefix)
+
     calibrated = False
     current_market_ts = 0
-    target_slug = get_slug_from_ts_for_asset(base_asset, get_current_slug_ts())
+    target_slug = fixed_slug or get_slug_from_ts_for_asset(asset, get_current_slug_ts())
     last_strike_price = None
-    stop_event = threading.Event()
-    price_thread = threading.Thread(
-        target=chainlink_price_collector,
-        args=(stop_event,),
-        kwargs={"poll_interval": 0.5, "csv_store": csv_store, "backfill_interval": 1.0},
-        daemon=True
-    )
-    price_thread.start()
 
-    try:
-        point = fetch_chainlink_stream_latest()
-        if point:
-            CHAINLINK_CACHE.add(point["ts"], point["price"])
-    except Exception:
-        pass
-
-    try:
-        while True:
-            # 1. Slug Rotation
+    while not stop_event.is_set():
+        if fixed_slug is None:
             ts = get_current_slug_ts()
             if ts != current_market_ts:
                 current_market_ts = ts
-                target_slug = get_slug_from_ts_for_asset(base_asset, ts)
-                print(f"\n[System] Switching to market: {target_slug}")
+                target_slug = get_slug_from_ts_for_asset(asset, ts)
+                _safe_print(f"\n[System:{asset}] Switching to market: {target_slug}")
                 calibrated = False
                 last_strike_price = None
 
-            # 2. Fetch Data
-            poly_data = get_polymarket_data(target_slug)
-            now = datetime.now(timezone.utc)
-            cl_now = get_chainlink_price_at(now.timestamp())
-            if cl_now:
-                pick = cl_now.get("before") or cl_now.get("after")
-                btc_price = pick["price"] if pick else None
-            else:
-                btc_price = None
-            
-            if poly_data and btc_price:
-                info = parse_market_info(poly_data)
-                
-                if info:
-                    strike_stream = get_strike_price_from_stream_for_slug(target_slug)
-                    strike_delta_min = None
-                    if strike_stream is not None:
-                        strike_delta_min = (strike_stream.get("delta_sec") or 0.0) / 60.0
-                        if strike_delta_min <= STRIKE_MAX_DELTA_MIN:
-                            info['strike_price'] = strike_stream["price"]
-                        else:
-                            info['strike_price'] = None
-                    elif args.strike is not None and not info.get('strike_price'):
-                        info['strike_price'] = float(args.strike)
+        poly_data = get_polymarket_data(target_slug)
+        now = datetime.now(timezone.utc)
+        cl_now = chainlink_cache.get_around(now.timestamp())
+        if cl_now:
+            pick = cl_now.get("before") or cl_now.get("after")
+            px_now = pick["price"] if pick else None
+        else:
+            px_now = None
 
-                    # Cache Strike
-                    if info['strike_price']:
-                        last_strike_price = info['strike_price']
-                    
-                    # 3. Calibration (Determine Strike Price)
-                    if info['strike_price'] and not calibrated:
-                        # Market Start Time is roughly Expiry - 15m.
-                        start_ts = info['expiry_dt'] - timedelta(minutes=15)
-                        
-                        actual_strike = info['strike_price']
-                        calibrated = True
-                        
-                        print(f"\n[Calibration] Market: {target_slug}")
-                        print(f"[Calibration] Title:      {info.get('title', 'N/A')}")
-                        print(f"[Calibration] Start Time:     {start_ts.strftime('%H:%M:%S')} UTC")
-                        
-                        cl_data = info.get('chainlink_data')
-                        if cl_data:
-                            # Show Before
-                            before = cl_data.get("before")
-                            if before:
-                                before_ts_dt = datetime.fromtimestamp(before["ts"], timezone.utc)
-                                print(f"[Calibration] Chainlink [Before]: {before['price']:.2f} @ {before_ts_dt.strftime('%H:%M:%S')} (Delta: {(before_ts_dt - start_ts).total_seconds():.0f}s)")
-                            else:
-                                print(f"[Calibration] Chainlink [Before]: N/A")
-                            
-                            # Show After
-                            after = cl_data.get("after")
-                            if after:
-                                after_ts_dt = datetime.fromtimestamp(after["ts"], timezone.utc)
-                                print(f"[Calibration] Chainlink [After]:  {after['price']:.2f} @ {after_ts_dt.strftime('%H:%M:%S')} (Delta: {(after_ts_dt - start_ts).total_seconds():.0f}s)")
-                            else:
-                                print(f"[Calibration] Chainlink [After]:  N/A (No update yet)")
-                        else:
-                            print(f"[Calibration] Chainlink Data: N/A")
-
-                        print(f"[Calibration] Strike Price (Base): {actual_strike:.2f}")
-
-                    # 4. Calculation
-                    # Use Chainlink Stream Price directly
-                    display_btc_price = btc_price 
-                    
-                    display_strike = info['strike_price']
-                    
-                    if display_strike:
-                        diff = display_btc_price - display_strike
-                        diff_str = f"{diff:.2f}"
-                        status = "ITM" if diff > 0 else "OTM"
-                        strike_str = f"{display_strike:.2f}"
+        if poly_data and px_now is not None:
+            info = parse_market_info(poly_data, chainlink_cache=chainlink_cache)
+            if info:
+                strike_stream = get_strike_price_from_stream_for_slug(target_slug, chainlink_cache=chainlink_cache)
+                strike_delta_sec = None
+                if strike_stream is not None:
+                    strike_delta_sec = (strike_stream.get("delta_sec") or 0.0)
+                    if strike_delta_sec <= STRIKE_MAX_DELTA_SEC:
+                        info['strike_price'] = strike_stream["price"]
                     else:
-                        diff_str = "-"
-                        status = "Wait"
-                        strike_str = "no_price_data" if (strike_delta_min is not None and strike_delta_min > STRIKE_MAX_DELTA_MIN) else "TBD"
+                        info['strike_price'] = None
+                elif args.strike is not None and not info.get('strike_price'):
+                    info['strike_price'] = float(args.strike)
 
-                    if info['expiry_dt']:
-                        time_left = info['expiry_dt'] - now
-                        time_left_sec = time_left.total_seconds()
-                        
-                        if time_left_sec < 0:
-                            time_left_str = "Expired"
+                if info['strike_price']:
+                    last_strike_price = info['strike_price']
+
+                if info['strike_price'] and not calibrated:
+                    start_ts = info['expiry_dt'] - timedelta(minutes=15)
+                    actual_strike = info['strike_price']
+                    calibrated = True
+
+                    _safe_print(f"\n[Calibration] Market: {target_slug}")
+                    _safe_print(f"[Calibration] Title:      {info.get('title', 'N/A')}")
+                    _safe_print(f"[Calibration] Start Time:     {start_ts.strftime('%H:%M:%S')} UTC")
+
+                    cl_data = info.get('chainlink_data')
+                    if cl_data:
+                        before = cl_data.get("before")
+                        if before:
+                            before_ts_dt = datetime.fromtimestamp(before["ts"], timezone.utc)
+                            _safe_print(f"[Calibration] Chainlink [Before]: {before['price']:.2f} @ {before_ts_dt.strftime('%H:%M:%S')} (Delta: {(before_ts_dt - start_ts).total_seconds():.0f}s)")
                         else:
-                            mm, ss = divmod(int(time_left_sec), 60)
-                            hh, mm = divmod(mm, 60)
-                            time_left_str = f"{hh:02d}:{mm:02d}:{ss:02d}" if hh > 0 else f"{mm:02d}:{ss:02d}"
-                    else:
-                        time_left_str = "?"
-                        time_left_sec = 0
+                            _safe_print(f"[Calibration] Chainlink [Before]: N/A")
 
-                    # Log to CSV
-                    csv_store.append_row([
-                        now.isoformat(),
-                        f"{time_left_sec:.0f}",
-                        f"{display_btc_price:.2f}",
-                        strike_str,
-                        diff_str,
-                        f"{info['yes_price']:.2f}",
-                        f"{info['best_bid']:.2f}",
-                        f"{info['best_ask']:.2f}",
-                        "",
-                        target_slug
-                    ])
-                    
-                    # Print Row
-                    row = f"{now.strftime('%H:%M:%S'):<10} | {time_left_str:<10} | {display_btc_price:<10.2f} | {strike_str:<10} | {diff_str:<10} | {info['yes_price']:<10.2f} | {info['best_ask']:<6.2f} | {info['best_bid']:<6.2f} | {status}"
-                    print(row)
-                    
+                        after = cl_data.get("after")
+                        if after:
+                            after_ts_dt = datetime.fromtimestamp(after["ts"], timezone.utc)
+                            _safe_print(f"[Calibration] Chainlink [After]:  {after['price']:.2f} @ {after_ts_dt.strftime('%H:%M:%S')} (Delta: {(after_ts_dt - start_ts).total_seconds():.0f}s)")
+                        else:
+                            _safe_print(f"[Calibration] Chainlink [After]:  N/A (No update yet)")
+                    else:
+                        _safe_print(f"[Calibration] Chainlink Data: N/A")
+
+                    _safe_print(f"[Calibration] Strike Price (Base): {actual_strike:.2f}")
+
+                display_price = px_now
+                display_strike = info['strike_price']
+
+                if display_strike:
+                    diff = display_price - display_strike
+                    diff_str = f"{diff:.2f}"
+                    status = "ITM" if diff > 0 else "OTM"
+                    strike_str = f"{display_strike:.2f}"
                 else:
-                    print(f"Waiting for market data... ({target_slug})")
+                    diff_str = "-"
+                    status = "Wait"
+                    strike_str = "no_price_data" if (strike_delta_sec is not None and strike_delta_sec > STRIKE_MAX_DELTA_SEC) else "TBD"
+
+                if info['expiry_dt']:
+                    time_left = info['expiry_dt'] - now
+                    time_left_sec = time_left.total_seconds()
+                    if time_left_sec < 0:
+                        time_left_str = "Expired"
+                    else:
+                        mm, ss = divmod(int(time_left_sec), 60)
+                        hh, mm = divmod(mm, 60)
+                        time_left_str = f"{hh:02d}:{mm:02d}:{ss:02d}" if hh > 0 else f"{mm:02d}:{ss:02d}"
+                else:
+                    time_left_str = "?"
+                    time_left_sec = 0
+
+                csv_store.append_row([
+                    now.isoformat(),
+                    f"{time_left_sec:.0f}",
+                    f"{display_price:.2f}",
+                    strike_str,
+                    diff_str,
+                    f"{info['yes_price']:.2f}",
+                    f"{info['best_bid']:.2f}",
+                    f"{info['best_ask']:.2f}",
+                    "",
+                    target_slug
+                ])
+
+                row = f"{now.strftime('%H:%M:%S'):<10} | {time_left_str:<10} | {display_price:<10.2f} | {strike_str:<10} | {diff_str:<10} | {info['yes_price']:<10.2f} | {info['best_ask']:<6.2f} | {info['best_bid']:<6.2f} | {status}"
+                if show_prefix:
+                    row = f"{asset.upper():<5} | {row}"
+                _safe_print(row)
             else:
-                print("Failed to fetch data.")
-                
-            time.sleep(POLL_INTERVAL)
-            
+                _safe_print(f"Waiting for market data... ({target_slug})")
+        else:
+            _safe_print(f"Failed to fetch data. ({target_slug})")
+
+        stop_event.wait(POLL_INTERVAL)
+
+def main():
+    args = parse_arguments()
+    items = _parse_slug_inputs(args)
+    targets = []
+    for it in items:
+        s = _extract_event_slug_from_input(it)
+        fixed_slug = s if _is_fixed_event_slug(s) else None
+        asset = _parse_asset_from_slug(s) or "btc"
+        targets.append({"asset": asset, "fixed_slug": fixed_slug})
+    if not targets:
+        targets = [{"asset": "btc", "fixed_slug": None}]
+
+    assets = sorted({t["asset"] for t in targets})
+    caches = {a: ChainlinkPriceCache(keep_seconds=7200) for a in assets}
+    stores = {a: CsvStore(f"polymarket_{a}_15m.csv") for a in assets}
+
+    stop_event = threading.Event()
+    price_threads = []
+    for a in assets:
+        th = threading.Thread(
+            target=chainlink_price_collector_for_asset,
+            args=(a, caches[a], stop_event),
+            kwargs={"poll_interval": 0.5, "csv_store": stores[a], "backfill_interval": 1.0},
+            daemon=True
+        )
+        th.start()
+        price_threads.append(th)
+
+    monitor_threads = []
+    show_prefix = len(targets) > 1
+    for t in targets:
+        a = t["asset"]
+        fixed_slug = t["fixed_slug"]
+        th = threading.Thread(
+            target=_monitor_target,
+            args=(a, fixed_slug, args, stop_event, caches[a], stores[a]),
+            kwargs={"show_prefix": show_prefix},
+            daemon=True
+        )
+        th.start()
+        monitor_threads.append(th)
+
+    try:
+        while True:
+            time.sleep(0.5)
     except KeyboardInterrupt:
-        print("\nMonitoring stopped.")
+        _safe_print("\nMonitoring stopped.")
     finally:
         stop_event.set()
         try:
-            csv_store.backfill_from_chainlink_cache(max_rows=10**9)
-        except Exception as e:
-            print(f"[Backfill] Failed: {e}")
+            for a in assets:
+                try:
+                    stores[a].backfill_from_chainlink_cache(max_rows=10**9, chainlink_cache=caches[a])
+                except Exception as e:
+                    _safe_print(f"[Backfill:{a}] Failed: {e}")
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
