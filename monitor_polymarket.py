@@ -328,6 +328,18 @@ def _chainlink_pick_strike_with_delta(times, prices, target_ts):
         return after[1], delta_after
     return before[1], delta_before
 
+def _chainlink_strike_state(times, prices, target_ts):
+    if not times:
+        return "unknown", None, None
+    if target_ts < times[0] or target_ts > times[-1]:
+        return "unknown", None, None
+    strike, delta_sec = _chainlink_pick_strike_with_delta(times, prices, target_ts)
+    if strike is None or delta_sec is None:
+        return "unknown", None, delta_sec
+    if delta_sec > STRIKE_MAX_DELTA_SEC:
+        return "invalid", None, delta_sec
+    return "ok", strike, delta_sec
+
 def _try_slug_ts(slug):
     if not slug:
         return None
@@ -490,26 +502,23 @@ class CsvStore:
                     if existing_btc is not None:
                         stream_px = round(existing_btc, decimals)
 
-                strike = None
                 slug = r[CSV_I_SLUG]
                 if has_cache and slug:
                     try:
                         slug_ts = int(slug.rsplit('-', 1)[-1])
                         if slug_ts in strike_cache:
-                            strike, strike_invalid = strike_cache[slug_ts]
+                            strike_state, strike = strike_cache[slug_ts]
                         else:
-                            strike, strike_delta_sec = _chainlink_pick_strike_with_delta(times, prices, float(slug_ts))
-                            strike_invalid = bool(strike_delta_sec is not None and strike_delta_sec > STRIKE_MAX_DELTA_SEC)
-                            strike_cache[slug_ts] = (strike, strike_invalid)
-                            if strike_invalid:
-                                strike = None
+                            strike_state, strike, _ = _chainlink_strike_state(times, prices, float(slug_ts))
+                            strike_cache[slug_ts] = (strike_state, strike)
                     except Exception:
+                        strike_state = "unknown"
                         strike = None
-                        strike_invalid = False
                 else:
-                    strike_invalid = False
+                    strike_state = "unknown"
+                    strike = None
 
-                if strike_invalid:
+                if strike_state == "invalid":
                     if r[CSV_I_STRIKE] != "no_price_data":
                         r[CSV_I_STRIKE] = "no_price_data"
                         updated += 1
@@ -520,7 +529,7 @@ class CsvStore:
                     continue
 
                 strike_for_diff = None
-                if strike is not None:
+                if strike_state == "ok" and strike is not None:
                     strike_2 = round(strike, decimals)
                     existing_strike = _try_parse_float(r[CSV_I_STRIKE])
                     if existing_strike is None or abs(existing_strike - strike_2) > tol:
