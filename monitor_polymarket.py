@@ -519,14 +519,19 @@ class CsvStore:
                     strike = None
 
                 if strike_state == "invalid":
-                    if r[CSV_I_STRIKE] != "no_price_data":
-                        r[CSV_I_STRIKE] = "no_price_data"
-                        updated += 1
-                    if r[CSV_I_DIFF] != "-":
-                        r[CSV_I_DIFF] = "-"
-                        updated += 1
-                    data_rows[i] = r
-                    continue
+                    # If we already have a valid strike price, treat this as a gap in cache (unknown)
+                    # rather than invalidating the existing data.
+                    if _try_parse_float(r[CSV_I_STRIKE]) is not None:
+                        strike_state = "unknown"
+                    else:
+                        if r[CSV_I_STRIKE] != "no_price_data":
+                            r[CSV_I_STRIKE] = "no_price_data"
+                            updated += 1
+                        if r[CSV_I_DIFF] != "-":
+                            r[CSV_I_DIFF] = "-"
+                            updated += 1
+                        data_rows[i] = r
+                        continue
 
                 strike_for_diff = None
                 if strike_state == "ok" and strike is not None:
